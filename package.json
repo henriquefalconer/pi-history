@@ -1,0 +1,28 @@
+{
+  "name": "@hfalconer/pi-history",
+  "version": "0.1.0",
+  "description": "Persistent cross-session prompt history for Pi.",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "files": ["index.ts", "src", "README.md"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/henriquefalconer/pi-history.git"
+  },
+  "bugs": {
+    "url": "https://github.com/henriquefalconer/pi-history/issues"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": {
+    "build:test": "tsc src/history.ts --outDir dist-test --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck",
+    "test": "npm run build:test && node --test test/history.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
