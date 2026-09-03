@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { promptsFromAllSessions, promptsFromSessions, userPromptText } from "../dist-test/history.js";
+import { HEADLESS_MARKER, isHeadlessSession, promptsFromAllSessions, promptsFromSessions, userPromptText } from "../dist-test/history.js";
 
 const session = (path, modified, prompts) => ({
   path,
@@ -26,6 +26,13 @@ test("session-local history keeps newest prompts first", () => {
     session("middle", "2024-01-02", ["middle 1"]),
   ];
   assert.deepEqual(promptsFromSessions(sessions), ["new 2", "new 1", "middle 1", "old 2", "old 1"]);
+});
+
+test("new sessions exclude sessions marked as headless", () => {
+  const headless = session("headless", "2024-01-04", ["automation"]);
+  headless.entries = [{ type: "custom", customType: HEADLESS_MARKER }, ...headless.entries];
+  assert.equal(isHeadlessSession(headless.entries), true);
+  assert.deepEqual(promptsFromAllSessions([headless, session("interactive", "2024-01-03", ["keep"]) ]), ["keep"]);
 });
 
 test("new sessions interleave all prompts by reverse prompt time", () => {

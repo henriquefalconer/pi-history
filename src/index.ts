@@ -1,7 +1,7 @@
 import type { ExtensionAPI, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { promptsFromAllSessions, promptsFromSessions, type SessionLike, userPromptText } from "./history.js";
+import { HEADLESS_MARKER, isHeadlessSession, promptsFromAllSessions, promptsFromSessions, type SessionLike, userPromptText } from "./history.js";
 
 async function loadHistory(reason: SessionStartEvent["reason"], currentPath: string): Promise<string[]> {
   if (reason === "resume") {
@@ -32,10 +32,20 @@ async function loadHistory(reason: SessionStartEvent["reason"], currentPath: str
 
 export default function (pi: ExtensionAPI): void {
   pi.on("session_start", async (event: SessionStartEvent, ctx) => {
+    // Headless runs have no editor to populate. Mark their persisted session so
+    // future /new launches do not treat automation prompts as interactive history.
+    const entries = ctx.sessionManager.getEntries();
+    if (ctx.mode !== "tui") {
+      if (ctx.sessionManager.getSessionFile() && !isHeadlessSession(entries)) {
+        pi.appendEntry(HEADLESS_MARKER);
+      }
+      return;
+    }
+
     // Keep Pi's native Editor and its history navigation. We only seed the
     // editor instance mounted after a session switch; normal startup remains
     // entirely on Pi's own renderSessionEntries() path.
-    const hasCurrentPrompts = ctx.sessionManager.getEntries().some((entry) => Boolean(userPromptText(entry)?.trim()));
+    const hasCurrentPrompts = entries.some((entry) => Boolean(userPromptText(entry)?.trim()));
     const shouldSeed = event.reason === "new" || event.reason === "resume" ||
       (event.reason === "startup" && !hasCurrentPrompts);
     if (!shouldSeed || !ctx.hasUI || ctx.mode !== "tui") return;
@@ -62,4 +72,4 @@ export default function (pi: ExtensionAPI): void {
   });
 }
 
-export { promptsFromAllSessions, promptsFromSessions, userPromptText } from "./history.js";
+export { HEADLESS_MARKER, isHeadlessSession, promptsFromAllSessions, promptsFromSessions, userPromptText } from "./history.js";

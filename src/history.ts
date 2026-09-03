@@ -1,8 +1,17 @@
+export const HEADLESS_MARKER = "hfalconer/pi-history:headless";
+
 export type SessionLike = {
   path: string;
   modified: Date;
   entries: readonly unknown[];
 };
+
+export function isHeadlessSession(entries: readonly unknown[]): boolean {
+  return entries.some((entry) => {
+    const candidate = entry as { type?: unknown; customType?: unknown };
+    return candidate.type === "custom" && candidate.customType === HEADLESS_MARKER;
+  });
+}
 
 type MessageEntry = {
   type: "message";
@@ -43,7 +52,7 @@ export function promptsFromAllSessions(sessions: readonly SessionLike[], current
   const records: Array<{ prompt: string; timestamp: number; order: number }> = [];
   let order = 0;
   for (const session of sessions) {
-    if (session.path === currentPath) continue;
+    if (session.path === currentPath || isHeadlessSession(session.entries)) continue;
     for (const entry of session.entries) {
       const prompt = userPromptText(entry);
       if (!prompt?.trim()) continue;
