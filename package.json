@@ -18,7 +18,7 @@
   "type": "module",
   "pi": { "extensions": ["./index.ts"] },
   "scripts": {
-    "build:test": "tsc src/history.ts --outDir dist-test --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck",
+    "build:test": "tsc --ignoreConfig src/history.ts --outDir dist-test --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck",
     "test": "npm run build:test && node --test test/history.test.mjs",
     "typecheck": "tsc --noEmit"
   },
