@@ -1,6 +1,6 @@
 {
   "name": "@hfalconer/pi-history",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Persistent cross-session prompt history for Pi.",
   "keywords": [
     "pi-package"
