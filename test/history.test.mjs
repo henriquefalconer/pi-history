@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { promptsFromSessions, userPromptText } from "../dist-test/history.js";
+import { promptsFromAllSessions, promptsFromSessions, userPromptText } from "../dist-test/history.js";
 
 const session = (path, modified, prompts) => ({
   path,
   modified: new Date(modified),
-  entries: prompts.map((text) => ({ type: "message", message: { role: "user", content: text } })),
+  entries: prompts.map((text, index) => ({
+    type: "message",
+    timestamp: new Date(new Date(modified).getTime() + index * 86400000).toISOString(),
+    message: { role: "user", content: text },
+  })),
 });
 
 test("extracts the same text Pi renders for user messages", () => {
@@ -15,13 +19,21 @@ test("extracts the same text Pi renders for user messages", () => {
   ] } }), "first second");
 });
 
-test("new sessions put newest session prompts before older sessions", () => {
+test("session-local history keeps newest prompts first", () => {
   const sessions = [
     session("old", "2024-01-01", ["old 1", "old 2"]),
     session("new", "2024-01-03", ["new 1", "new 2"]),
     session("middle", "2024-01-02", ["middle 1"]),
   ];
   assert.deepEqual(promptsFromSessions(sessions), ["new 2", "new 1", "middle 1", "old 2", "old 1"]);
+});
+
+test("new sessions interleave all prompts by reverse prompt time", () => {
+  const sessions = [
+    session("old", "2024-01-01", ["old 1", "old 2"]),
+    session("new", "2024-01-03", ["new 1", "new 2"]),
+  ];
+  assert.deepEqual(promptsFromAllSessions(sessions), ["new 2", "new 1", "old 2", "old 1"]);
 });
 
 test("does not import the session being created", () => {

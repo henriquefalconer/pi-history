@@ -21,8 +21,8 @@ export function userPromptText(entry: unknown): string | undefined {
 }
 
 /**
- * Return prompts in the order Editor.addToHistory produces: newest first,
- * with every prompt from the newest session before older sessions.
+ * Return one session's prompts in the order Editor.addToHistory produces.
+ * This is kept separate because resume must preserve Pi's existing behavior.
  */
 export function promptsFromSessions(sessions: readonly SessionLike[], currentPath?: string): string[] {
   const ordered = [...sessions]
@@ -36,4 +36,27 @@ export function promptsFromSessions(sessions: readonly SessionLike[], currentPat
     }
   }
   return result;
+}
+
+/** Return every persisted user prompt globally, newest prompt first. */
+export function promptsFromAllSessions(sessions: readonly SessionLike[], currentPath?: string): string[] {
+  const records: Array<{ prompt: string; timestamp: number; order: number }> = [];
+  let order = 0;
+  for (const session of sessions) {
+    if (session.path === currentPath) continue;
+    for (const entry of session.entries) {
+      const prompt = userPromptText(entry);
+      if (!prompt?.trim()) continue;
+      const timestampValue = (entry as { timestamp?: unknown }).timestamp;
+      const timestamp = typeof timestampValue === "string" ? Date.parse(timestampValue) : Number.NaN;
+      records.push({
+        prompt: prompt.trim(),
+        timestamp: Number.isFinite(timestamp) ? timestamp : session.modified.getTime(),
+        order: order++,
+      });
+    }
+  }
+  return records
+    .sort((a, b) => b.timestamp - a.timestamp || b.order - a.order)
+    .map((record) => record.prompt);
 }

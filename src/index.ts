@@ -1,7 +1,7 @@
 import type { ExtensionAPI, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { promptsFromSessions, type SessionLike, userPromptText } from "./history.js";
+import { promptsFromAllSessions, promptsFromSessions, type SessionLike, userPromptText } from "./history.js";
 
 async function loadHistory(reason: SessionStartEvent["reason"], currentPath: string): Promise<string[]> {
   if (reason === "resume") {
@@ -27,7 +27,7 @@ async function loadHistory(reason: SessionStartEvent["reason"], currentPath: str
       // A session can disappear while the global list is being read. Ignore it.
     }
   }
-  return promptsFromSessions(sessions);
+  return promptsFromAllSessions(sessions);
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -62,4 +62,4 @@ export default function (pi: ExtensionAPI): void {
   });
 }
 
-export { promptsFromSessions, userPromptText } from "./history.js";
+export { promptsFromAllSessions, promptsFromSessions, userPromptText } from "./history.js";
