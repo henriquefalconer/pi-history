@@ -95,3 +95,16 @@ test("keeps up to 1000 prompts, newest first", async () => {
   assert.equal(all[0], "p1199");
   assert.equal(all[999], "p200");
 });
+
+test("filterInteractiveSessions keeps interactive and current sessions only", async () => {
+  const { filterInteractiveSessions } = await import("../dist-test/scan.js");
+  const { sessions, cache, root } = await fixture();
+  const list = ["a", "forks/b", "headless", "interactive", "broken", "missing"].map((n) => ({ path: join(sessions, `${n}.jsonl`), name: n }));
+  const kept = (await filterInteractiveSessions(list, cache, join(sessions, "forks/b.jsonl"), SINCE)).map((s) => s.name);
+  assert.deepEqual(kept, ["a", "forks/b", "interactive", "broken", "missing"]);
+  // The partial listing must not prune cache entries the full scan relies on.
+  const full = await promptsFromSessionsDir(root, cache, undefined, SINCE);
+  assert.deepEqual(full, ["ok2", "ok1", "solo", "a2", "a1"]);
+  const cached = JSON.parse(await readFile(cache, "utf8"));
+  assert.equal(Object.keys(cached.sessions).length, 5);
+});

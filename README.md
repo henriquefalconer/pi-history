@@ -6,6 +6,7 @@ Loads prompt history across session boundaries while keeping Pi's native editor 
 - A new session adds the 1000 newest prompts from all other interactive sessions on the machine, newest first.
 - Duplicate handling, draft restoration, and arrow-key behavior remain unchanged; the native 100-entry history limit is raised to 1000.
 - Interactive sessions are marked when Pi's TUI starts them. Headless (`pi -p`) sessions are marked as headless when the extension is loaded, and never contribute prompts.
+- `/resume` and its keyboard shortcut list interactive sessions only, using the same classification. The `pi -r` and `pi -c` flags run before extensions load and are not filtered.
 - Headless runs launched with `--no-extensions` cannot be marked, so any unmarked session modified after this version first ran is treated as headless. Older unmarked sessions are kept unless they hold a single prompt, the shape of a `pi -p` run.
 
 ## How the scan stays cheap

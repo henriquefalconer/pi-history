@@ -123,23 +123,23 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
   return results;
 }
 
+type SyncedCache = { cache: Cache; markerSince: number };
+
 /**
- * Return prompts from every session under sessionsDir, newest first, bounded
- * by MAX_PROMPTS. Sessions are streamed line by line and results are cached by
- * (size, mtime) so subsequent starts only re-read sessions that changed.
+ * Bring the cache up to date for `files`: stream sessions whose size or mtime
+ * changed, keep the rest. With `prune`, entries for files not listed are
+ * dropped (used by the full scan so deleted sessions leave the cache).
  */
-export async function promptsFromSessionsDir(sessionsDir: string, cachePath: string, currentPath?: string, now = Date.now()): Promise<string[]> {
-  const [files, cache] = await Promise.all([listSessionFiles(sessionsDir), readCache(cachePath)]);
+async function syncCache(files: FileInfo[], cachePath: string, options: { prune: boolean; keep?: string; now: number }): Promise<SyncedCache> {
+  const cache = await readCache(cachePath);
   // The first run of a marker-aware version fixes the point after which
   // unmarked sessions are treated as headless. It is persisted so it survives.
-  const markerSince = Number.isFinite(cache.markerSince) ? cache.markerSince : now;
-  const markerSinceChanged = markerSince !== cache.markerSince;
-  const relevant = files.filter((file) => file.path !== currentPath);
-  const stale = relevant.filter((file) => {
+  const markerSince = Number.isFinite(cache.markerSince) ? cache.markerSince : options.now;
+  const fresh = (file: FileInfo): CachedSession | undefined => {
     const cached = cache.sessions[file.path];
-    return !cached || cached.size !== file.size || cached.mtime !== file.mtime;
-  });
-
+    return cached && cached.size === file.size && cached.mtime === file.mtime ? cached : undefined;
+  };
+  const stale = files.filter((file) => !fresh(file));
   const scanned = await mapLimit(stale, CONCURRENCY, async (file) => {
     try {
       return { file, scan: await scanSession(file.path, file.mtime) };
@@ -148,24 +148,37 @@ export async function promptsFromSessionsDir(sessionsDir: string, cachePath: str
     }
   });
 
-  const next: Cache = { version: CACHE_VERSION, markerSince, sessions: {} };
-  for (const file of relevant) {
-    const cached = cache.sessions[file.path];
-    if (cached && cached.size === file.size && cached.mtime === file.mtime) next.sessions[file.path] = cached;
+  const sessions: Record<string, CachedSession> = options.prune ? {} : { ...cache.sessions };
+  if (options.prune) {
+    for (const file of files) {
+      const cached = fresh(file);
+      if (cached) sessions[file.path] = cached;
+    }
+    if (options.keep && cache.sessions[options.keep]) sessions[options.keep] = cache.sessions[options.keep] as CachedSession;
   }
   for (const result of scanned) {
-    if (result) next.sessions[result.file.path] = { size: result.file.size, mtime: result.file.mtime, ...result.scan };
+    if (result) sessions[result.file.path] = { size: result.file.size, mtime: result.file.mtime, ...result.scan };
   }
-  // Keep the current session's cached entry, if any, so it isn't rescanned later.
-  if (currentPath && cache.sessions[currentPath]) next.sessions[currentPath] = cache.sessions[currentPath] as CachedSession;
-  if (markerSinceChanged || stale.length > 0 || Object.keys(next.sessions).length !== Object.keys(cache.sessions).length) {
-    await writeCache(cachePath, next);
-  }
+  const next: Cache = { version: CACHE_VERSION, markerSince, sessions };
+  const changed = markerSince !== cache.markerSince || stale.length > 0 ||
+    Object.keys(sessions).length !== Object.keys(cache.sessions).length;
+  if (changed) await writeCache(cachePath, next);
+  return { cache: next, markerSince };
+}
+
+/**
+ * Return prompts from every session under sessionsDir, newest first, bounded
+ * by MAX_PROMPTS. Sessions are streamed line by line and results are cached by
+ * (size, mtime) so subsequent starts only re-read sessions that changed.
+ */
+export async function promptsFromSessionsDir(sessionsDir: string, cachePath: string, currentPath?: string, now = Date.now()): Promise<string[]> {
+  const files = (await listSessionFiles(sessionsDir)).filter((file) => file.path !== currentPath);
+  const { cache, markerSince } = await syncCache(files, cachePath, { prune: true, keep: currentPath, now });
 
   const records: Array<PromptRecord & { order: number }> = [];
   let order = 0;
-  for (const file of relevant) {
-    const session = next.sessions[file.path];
+  for (const file of files) {
+    const session = cache.sessions[file.path];
     if (!session || !includeInGlobalHistory(session.kind, session.promptCount, file.mtime, markerSince)) continue;
     for (const record of session.prompts) records.push({ ...record, order: order++ });
   }
@@ -173,4 +186,30 @@ export async function promptsFromSessionsDir(sessionsDir: string, cachePath: str
     .sort((a, b) => b.timestamp - a.timestamp || b.order - a.order)
     .slice(0, MAX_PROMPTS)
     .map((record) => record.prompt);
+}
+
+/**
+ * Keep only interactive sessions from a list produced by Pi's own session
+ * listing (used for /resume). The current session is always kept. Sessions
+ * already classified in the cache cost one stat each; new ones are streamed.
+ */
+export async function filterInteractiveSessions<T extends { path: string }>(sessions: readonly T[], cachePath: string, currentPath?: string, now = Date.now()): Promise<T[]> {
+  const files: FileInfo[] = [];
+  await mapLimit([...sessions], 64, async (session) => {
+    try {
+      const info = await stat(session.path);
+      files.push({ path: session.path, size: info.size, mtime: info.mtimeMs });
+    } catch {
+      // Vanished since Pi listed it; Pi's own selector handles that case.
+    }
+  });
+  const { cache, markerSince } = await syncCache(files, cachePath, { prune: false, now });
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  return sessions.filter((session) => {
+    if (session.path === currentPath) return true;
+    const file = byPath.get(session.path);
+    const cached = file && cache.sessions[file.path];
+    if (!file || !cached) return true;
+    return includeInGlobalHistory(cached.kind, cached.promptCount, file.mtime, markerSince);
+  });
 }

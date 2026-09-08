@@ -3,7 +3,7 @@ import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { HEADLESS_MARKER, INTERACTIVE_MARKER, isHeadlessSession, markerKind, promptsFromSessions, userPromptText } from "./history.js";
-import { MAX_PROMPTS, promptsFromSessionsDir } from "./scan.js";
+import { MAX_PROMPTS, filterInteractiveSessions, promptsFromSessionsDir } from "./scan.js";
 import { appendFileSync } from "node:fs";
 
 const debugPath = process.env.PI_HISTORY_DEBUG;
@@ -35,11 +35,41 @@ async function loadHistory(reason: SessionStartEvent["reason"], currentPath: str
   return promptsFromSessionsDir(join(agentDir, "sessions"), join(agentDir, "pi-history-cache.json"), currentPath);
 }
 
+const PATCHED = Symbol.for("hfalconer/pi-history:session-list-patched");
+
+/**
+ * Pi has no hook for the /resume list, and its keyboard shortcut bypasses
+ * slash commands, so wrap SessionManager's static listings once. The wrap is
+ * process-wide and idempotent across extension reloads.
+ */
+function filterResumeList(cachePath: string, currentPath: () => string | undefined): void {
+  const target = SessionManager as unknown as Record<PropertyKey, unknown>;
+  if (target[PATCHED]) return;
+  target[PATCHED] = true;
+  for (const name of ["list", "listAll"] as const) {
+    const original = SessionManager[name] as (...args: unknown[]) => Promise<{ path: string }[]>;
+    target[name] = async function (this: unknown, ...args: unknown[]) {
+      const sessions = await original.apply(this, args);
+      const started = Date.now();
+      try {
+        const kept = await filterInteractiveSessions(sessions, cachePath, currentPath());
+        debug(`${name} filtered ${sessions.length} -> ${kept.length} in ${Date.now() - started}ms`);
+        return kept;
+      } catch (error) {
+        debug(`${name} filter failed ${String(error)}`);
+        return sessions;
+      }
+    };
+  }
+}
+
 export default function (pi: ExtensionAPI): void {
+  let currentSessionFile: string | undefined;
   pi.on("session_start", async (event: SessionStartEvent, ctx) => {
     // Headless runs have no editor to populate. Mark their persisted session so
     // future /new launches do not treat automation prompts as interactive history.
     const entries = ctx.sessionManager.getEntries();
+    currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
     debug(`session_start reason=${event.reason} mode=${ctx.mode} hasUI=${ctx.hasUI} file=${ctx.sessionManager.getSessionFile() ?? ""}`);
     if (ctx.mode !== "tui") {
       if (ctx.sessionManager.getSessionFile() && !isHeadlessSession(entries)) {
@@ -47,6 +77,8 @@ export default function (pi: ExtensionAPI): void {
       }
       return;
     }
+
+    filterResumeList(join(getAgentDir(), "pi-history-cache.json"), () => currentSessionFile);
 
     // Mark interactive sessions positively. Headless runs started with
     // --no-extensions never load this extension, so the global scan treats
