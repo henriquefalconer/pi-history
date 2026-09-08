@@ -2,7 +2,7 @@ import type { ExtensionAPI, SessionStartEvent } from "@earendil-works/pi-coding-
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
-import { HEADLESS_MARKER, isHeadlessSession, promptsFromSessions, userPromptText } from "./history.js";
+import { HEADLESS_MARKER, INTERACTIVE_MARKER, isHeadlessSession, markerKind, promptsFromSessions, userPromptText } from "./history.js";
 import { promptsFromSessionsDir } from "./scan.js";
 import { appendFileSync } from "node:fs";
 
@@ -46,6 +46,13 @@ export default function (pi: ExtensionAPI): void {
         pi.appendEntry(HEADLESS_MARKER);
       }
       return;
+    }
+
+    // Mark interactive sessions positively. Headless runs started with
+    // --no-extensions never load this extension, so the global scan treats
+    // unmarked sessions as headless and needs this marker to keep ours.
+    if (ctx.sessionManager.getSessionFile() && !entries.some((entry) => markerKind(entry) === "interactive")) {
+      pi.appendEntry(INTERACTIVE_MARKER);
     }
 
     // Keep Pi's native Editor and its history navigation. We only seed the
@@ -105,4 +112,4 @@ export default function (pi: ExtensionAPI): void {
   });
 }
 
-export { HEADLESS_MARKER, isHeadlessSession, promptsFromAllSessions, promptsFromSessions, userPromptText } from "./history.js";
+export { HEADLESS_MARKER, INTERACTIVE_MARKER, includeInGlobalHistory, isHeadlessSession, markerKind, promptsFromAllSessions, promptsFromSessions, userPromptText } from "./history.js";

@@ -5,7 +5,8 @@ Loads prompt history across session boundaries while keeping Pi's native editor 
 - Resuming a session seeds the newly mounted native editor from that session's user messages.
 - A new session adds the 100 newest prompts from all other interactive sessions on the machine, newest first.
 - The native 100-entry limit, duplicate handling, draft restoration, and arrow-key behavior remain unchanged.
-- Headless (`pi -p`) sessions are marked and never contribute prompts.
+- Interactive sessions are marked when Pi's TUI starts them. Headless (`pi -p`) sessions are marked as headless when the extension is loaded, and never contribute prompts.
+- Headless runs launched with `--no-extensions` cannot be marked, so any unmarked session modified after this version first ran is treated as headless. Older unmarked sessions are kept unless they hold a single prompt, the shape of a `pi -p` run.
 
 ## How the scan stays cheap
 

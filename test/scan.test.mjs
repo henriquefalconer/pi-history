@@ -1,50 +1,84 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, mkdir, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, mkdir, readFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HEADLESS_MARKER } from "../dist-test/history.js";
-import { promptsFromSessionsDir, scanSessionPrompts } from "../dist-test/scan.js";
+import { HEADLESS_MARKER, INTERACTIVE_MARKER, includeInGlobalHistory } from "../dist-test/history.js";
+import { promptsFromSessionsDir, scanSession } from "../dist-test/scan.js";
 
 const line = (obj) => JSON.stringify(obj) + "\n";
+const header = line({ type: "session", version: 3 });
 const user = (text, ts) => line({ type: "message", timestamp: ts, message: { role: "user", content: [{ type: "text", text }] } });
 const assistant = (text) => line({ type: "message", timestamp: "2024-01-01T00:00:00Z", message: { role: "assistant", content: [{ type: "text", text }] } });
+const marker = (customType) => line({ type: "custom", customType });
+const OLD = new Date("2024-06-01T00:00:00Z");
+const SINCE = new Date("2025-01-01T00:00:00Z").getTime();
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "pi-history-"));
   const sessions = join(dir, "sessions", "--proj--");
   await mkdir(join(sessions, "forks"), { recursive: true });
-  await writeFile(join(sessions, "a.jsonl"), line({ type: "session", version: 3 }) + user("a1", "2024-01-01T00:00:00Z") + assistant("noise \"role\":\"user\"") + user("a2", "2024-01-03T00:00:00Z"));
-  await writeFile(join(sessions, "forks", "b.jsonl"), line({ type: "session", version: 3 }) + user("b1", "2024-01-02T00:00:00Z"));
-  await writeFile(join(sessions, "headless.jsonl"), line({ type: "session", version: 3 }) + line({ type: "custom", customType: HEADLESS_MARKER }) + user("automation", "2024-01-05T00:00:00Z"));
-  await writeFile(join(sessions, "broken.jsonl"), "{not json\n" + user("ok", "2024-01-04T00:00:00Z"));
-  return { dir, sessions, cache: join(dir, "cache.json") };
+  const files = {
+    a: header + user("a1", "2024-01-01T00:00:00Z") + assistant("noise \"role\":\"user\"") + user("a2", "2024-01-03T00:00:00Z"),
+    "forks/b": header + user("b1", "2024-01-02T00:00:00Z"),                               // legacy single prompt: looks headless
+    headless: header + marker(HEADLESS_MARKER) + user("automation", "2024-01-05T00:00:00Z"),
+    interactive: header + marker(INTERACTIVE_MARKER) + user("solo", "2024-01-04T00:00:00Z"), // marked single prompt: kept
+    broken: "{not json\n" + user("ok1", "2024-01-06T00:00:00Z") + user("ok2", "2024-01-07T00:00:00Z"),
+  };
+  for (const [name, content] of Object.entries(files)) {
+    const path = join(sessions, `${name}.jsonl`);
+    await writeFile(path, content);
+    await utimes(path, OLD, OLD);
+  }
+  return { dir, sessions, cache: join(dir, "cache.json"), root: join(dir, "sessions") };
 }
 
-test("streams user prompts and skips headless sessions", async () => {
-  const { sessions } = await fixture();
-  assert.deepEqual((await scanSessionPrompts(join(sessions, "a.jsonl"), 0)).map((r) => r.prompt), ["a1", "a2"]);
-  assert.deepEqual(await scanSessionPrompts(join(sessions, "headless.jsonl"), 0), []);
+test("includeInGlobalHistory policy", () => {
+  assert.equal(includeInGlobalHistory("interactive", 1, 0, 0), true);
+  assert.equal(includeInGlobalHistory("headless", 5, 0, 0), false);
+  assert.equal(includeInGlobalHistory("unknown", 5, SINCE, SINCE), false);   // modified after marker era: headless
+  assert.equal(includeInGlobalHistory("unknown", 5, SINCE - 1, SINCE), true); // legacy multi-prompt: keep
+  assert.equal(includeInGlobalHistory("unknown", 1, SINCE - 1, SINCE), false); // legacy single prompt: pi -p
 });
 
-test("walks nested sessions, orders newest first, excludes current", async () => {
-  const { dir, sessions, cache } = await fixture();
-  const all = await promptsFromSessionsDir(join(dir, "sessions"), cache);
-  assert.deepEqual(all, ["ok", "a2", "b1", "a1"]);
-  const withoutA = await promptsFromSessionsDir(join(dir, "sessions"), cache, join(sessions, "a.jsonl"));
-  assert.deepEqual(withoutA, ["ok", "b1"]);
+test("streams user prompts and reports marker kind", async () => {
+  const { sessions } = await fixture();
+  const a = await scanSession(join(sessions, "a.jsonl"), 0);
+  assert.deepEqual({ kind: a.kind, prompts: a.prompts.map((r) => r.prompt), count: a.promptCount }, { kind: "unknown", prompts: ["a1", "a2"], count: 2 });
+  assert.deepEqual(await scanSession(join(sessions, "headless.jsonl"), 0), { kind: "headless", promptCount: 0, prompts: [] });
+  assert.equal((await scanSession(join(sessions, "interactive.jsonl"), 0)).kind, "interactive");
+});
+
+test("walks nested sessions, applies policy, orders newest first, excludes current", async () => {
+  const { sessions, cache, root } = await fixture();
+  const all = await promptsFromSessionsDir(root, cache, undefined, SINCE);
+  assert.deepEqual(all, ["ok2", "ok1", "solo", "a2", "a1"]);
+  const withoutA = await promptsFromSessionsDir(root, cache, join(sessions, "a.jsonl"), SINCE);
+  assert.deepEqual(withoutA, ["ok2", "ok1", "solo"]);
+});
+
+test("unmarked sessions modified after the marker era are treated as headless", async () => {
+  const { sessions, cache, root } = await fixture();
+  await promptsFromSessionsDir(root, cache, undefined, SINCE); // fixes markerSince
+  const path = join(sessions, "late.jsonl");
+  await writeFile(path, header + user("late1", "2026-01-01T00:00:00Z") + user("late2", "2026-01-02T00:00:00Z"));
+  const persisted = JSON.parse(await readFile(cache, "utf8"));
+  assert.equal(persisted.markerSince, SINCE);
+  assert.deepEqual(await promptsFromSessionsDir(root, cache, undefined, SINCE + 10 ** 9), ["ok2", "ok1", "solo", "a2", "a1"]);
+  // The same file with an interactive marker is kept.
+  await writeFile(path, header + marker(INTERACTIVE_MARKER) + user("late1", "2026-01-01T00:00:00Z"));
+  assert.deepEqual((await promptsFromSessionsDir(root, cache, undefined, SINCE + 10 ** 9))[0], "late1");
 });
 
 test("cache is reused and invalidated on change", async () => {
-  const { dir, sessions, cache } = await fixture();
-  await promptsFromSessionsDir(join(dir, "sessions"), cache);
+  const { sessions, cache, root } = await fixture();
+  await promptsFromSessionsDir(root, cache, undefined, SINCE);
   const first = JSON.parse(await readFile(cache, "utf8"));
-  assert.equal(Object.keys(first.sessions).length, 4);
-  // Poison the cache for a.jsonl; unchanged file must be served from cache.
+  assert.equal(Object.keys(first.sessions).length, 5);
   first.sessions[join(sessions, "a.jsonl")].prompts = [{ prompt: "cached", timestamp: 0 }];
   await writeFile(cache, JSON.stringify(first));
-  assert.deepEqual(await promptsFromSessionsDir(join(dir, "sessions"), cache), ["ok", "b1", "cached"]);
-  // Changing the file invalidates its entry.
-  await writeFile(join(sessions, "a.jsonl"), line({ type: "session", version: 3 }) + user("fresh", "2024-01-09T00:00:00Z"));
-  assert.deepEqual(await promptsFromSessionsDir(join(dir, "sessions"), cache), ["fresh", "ok", "b1"]);
+  assert.deepEqual(await promptsFromSessionsDir(root, cache, undefined, SINCE), ["ok2", "ok1", "solo", "cached"]);
+  const path = join(sessions, "a.jsonl");
+  await writeFile(path, header + marker(INTERACTIVE_MARKER) + user("fresh", "2024-01-09T00:00:00Z"));
+  assert.deepEqual(await promptsFromSessionsDir(root, cache, undefined, SINCE), ["fresh", "ok2", "ok1", "solo"]);
 });

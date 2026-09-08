@@ -1,4 +1,32 @@
 export const HEADLESS_MARKER = "hfalconer/pi-history:headless";
+export const INTERACTIVE_MARKER = "hfalconer/pi-history:interactive";
+
+export type SessionKind = "interactive" | "headless" | "unknown";
+
+/**
+ * Decide whether a session's prompts belong in global history.
+ *
+ * Interactive sessions are marked by this extension when Pi's TUI starts them.
+ * Headless runs launched with --no-extensions never load this extension, so an
+ * unmarked session modified after the interactive marker was introduced on
+ * this machine (`markerSince`) is treated as headless. Older unmarked sessions
+ * predate the marker: keep them unless they look like a `pi -p` run, which
+ * always records exactly one user prompt.
+ */
+export function includeInGlobalHistory(kind: SessionKind, promptCount: number, modified: number, markerSince: number): boolean {
+  if (kind === "interactive") return true;
+  if (kind === "headless") return false;
+  if (modified >= markerSince) return false;
+  return promptCount > 1;
+}
+
+export function markerKind(entry: unknown): SessionKind {
+  const candidate = entry as { type?: unknown; customType?: unknown };
+  if (candidate.type !== "custom") return "unknown";
+  if (candidate.customType === HEADLESS_MARKER) return "headless";
+  if (candidate.customType === INTERACTIVE_MARKER) return "interactive";
+  return "unknown";
+}
 
 export type SessionLike = {
   path: string;

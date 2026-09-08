@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { HEADLESS_MARKER, userPromptText } from "./history.js";
+import { includeInGlobalHistory, markerKind, type SessionKind, userPromptText } from "./history.js";
 
 /**
  * Upper bound on prompts seeded into the editor. Pi's Editor keeps at most 100
@@ -15,11 +15,13 @@ export const MAX_PROMPTS = 100;
 const MAX_LINE_BYTES = 256 * 1024;
 /** How many session files to stream concurrently on a cold cache. */
 const CONCURRENCY = 16;
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
+const MARKER_PREFIX = "hfalconer/pi-history:";
 
 export type PromptRecord = { prompt: string; timestamp: number };
-type CachedSession = { size: number; mtime: number; prompts: PromptRecord[] };
-type Cache = { version: number; sessions: Record<string, CachedSession> };
+export type SessionScan = { kind: SessionKind; promptCount: number; prompts: PromptRecord[] };
+type CachedSession = SessionScan & { size: number; mtime: number };
+type Cache = { version: number; markerSince: number; sessions: Record<string, CachedSession> };
 type FileInfo = { path: string; size: number; mtime: number };
 
 /** Recursively list every .jsonl under dir (sessions may be nested in forks/). */
@@ -49,45 +51,52 @@ export async function listSessionFiles(dir: string): Promise<FileInfo[]> {
 }
 
 /**
- * Stream one session file and return its user prompts without ever holding
- * the whole session in memory. Returns [] for headless sessions.
+ * Stream one session file and return its user prompts and marker kind without
+ * ever holding the whole session in memory. A headless marker stops the scan.
  */
-export async function scanSessionPrompts(path: string, modified: number): Promise<PromptRecord[]> {
+export async function scanSession(path: string, modified: number): Promise<SessionScan> {
   const prompts: PromptRecord[] = [];
+  let kind: SessionKind = "unknown";
+  let promptCount = 0;
   const rl = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
   try {
     for await (const line of rl) {
       if (line.length > MAX_LINE_BYTES) continue;
       // Cheap pre-filter: avoid JSON.parse on tool results, assistant output, etc.
       const isUser = line.includes('"role":"user"');
-      if (!isUser && !line.includes(HEADLESS_MARKER)) continue;
+      if (!isUser && !line.includes(MARKER_PREFIX)) continue;
       let entry: unknown;
       try {
         entry = JSON.parse(line);
       } catch {
         continue;
       }
-      const candidate = entry as { type?: unknown; customType?: unknown; timestamp?: unknown };
-      if (candidate.type === "custom" && candidate.customType === HEADLESS_MARKER) return [];
+      const marker = markerKind(entry);
+      if (marker === "headless") return { kind: "headless", promptCount, prompts: [] };
+      if (marker === "interactive") kind = "interactive";
       const prompt = userPromptText(entry)?.trim();
       if (!prompt) continue;
-      const parsed = typeof candidate.timestamp === "string" ? Date.parse(candidate.timestamp) : Number.NaN;
+      promptCount++;
+      const timestampValue = (entry as { timestamp?: unknown }).timestamp;
+      const parsed = typeof timestampValue === "string" ? Date.parse(timestampValue) : Number.NaN;
       prompts.push({ prompt, timestamp: Number.isFinite(parsed) ? parsed : modified });
+      if (prompts.length > MAX_PROMPTS) prompts.shift();
     }
   } finally {
     rl.close();
   }
-  return prompts.length > MAX_PROMPTS ? prompts.slice(-MAX_PROMPTS) : prompts;
+  return { kind, promptCount, prompts };
 }
 
 async function readCache(cachePath: string): Promise<Cache> {
   try {
     const parsed = JSON.parse(await readFile(cachePath, "utf8")) as Cache;
-    if (parsed?.version === CACHE_VERSION && parsed.sessions && typeof parsed.sessions === "object") return parsed;
+    if (parsed?.version === CACHE_VERSION && parsed.sessions && typeof parsed.sessions === "object" &&
+      typeof parsed.markerSince === "number") return parsed;
   } catch {
     // Missing or corrupt cache: rebuild from scratch.
   }
-  return { version: CACHE_VERSION, sessions: {} };
+  return { version: CACHE_VERSION, markerSince: Number.NaN, sessions: {} };
 }
 
 async function writeCache(cachePath: string, cache: Cache): Promise<void> {
@@ -119,8 +128,12 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promis
  * by MAX_PROMPTS. Sessions are streamed line by line and results are cached by
  * (size, mtime) so subsequent starts only re-read sessions that changed.
  */
-export async function promptsFromSessionsDir(sessionsDir: string, cachePath: string, currentPath?: string): Promise<string[]> {
+export async function promptsFromSessionsDir(sessionsDir: string, cachePath: string, currentPath?: string, now = Date.now()): Promise<string[]> {
   const [files, cache] = await Promise.all([listSessionFiles(sessionsDir), readCache(cachePath)]);
+  // The first run of a marker-aware version fixes the point after which
+  // unmarked sessions are treated as headless. It is persisted so it survives.
+  const markerSince = Number.isFinite(cache.markerSince) ? cache.markerSince : now;
+  const markerSinceChanged = markerSince !== cache.markerSince;
   const relevant = files.filter((file) => file.path !== currentPath);
   const stale = relevant.filter((file) => {
     const cached = cache.sessions[file.path];
@@ -129,30 +142,32 @@ export async function promptsFromSessionsDir(sessionsDir: string, cachePath: str
 
   const scanned = await mapLimit(stale, CONCURRENCY, async (file) => {
     try {
-      return { file, prompts: await scanSessionPrompts(file.path, file.mtime) };
+      return { file, scan: await scanSession(file.path, file.mtime) };
     } catch {
       return null;
     }
   });
 
-  const next: Cache = { version: CACHE_VERSION, sessions: {} };
+  const next: Cache = { version: CACHE_VERSION, markerSince, sessions: {} };
   for (const file of relevant) {
     const cached = cache.sessions[file.path];
     if (cached && cached.size === file.size && cached.mtime === file.mtime) next.sessions[file.path] = cached;
   }
   for (const result of scanned) {
-    if (result) next.sessions[result.file.path] = { size: result.file.size, mtime: result.file.mtime, prompts: result.prompts };
+    if (result) next.sessions[result.file.path] = { size: result.file.size, mtime: result.file.mtime, ...result.scan };
   }
   // Keep the current session's cached entry, if any, so it isn't rescanned later.
   if (currentPath && cache.sessions[currentPath]) next.sessions[currentPath] = cache.sessions[currentPath] as CachedSession;
-  if (stale.length > 0 || Object.keys(next.sessions).length !== Object.keys(cache.sessions).length) {
+  if (markerSinceChanged || stale.length > 0 || Object.keys(next.sessions).length !== Object.keys(cache.sessions).length) {
     await writeCache(cachePath, next);
   }
 
   const records: Array<PromptRecord & { order: number }> = [];
   let order = 0;
   for (const file of relevant) {
-    for (const record of next.sessions[file.path]?.prompts ?? []) records.push({ ...record, order: order++ });
+    const session = next.sessions[file.path];
+    if (!session || !includeInGlobalHistory(session.kind, session.promptCount, file.mtime, markerSince)) continue;
+    for (const record of session.prompts) records.push({ ...record, order: order++ });
   }
   return records
     .sort((a, b) => b.timestamp - a.timestamp || b.order - a.order)
