@@ -1,7 +1,20 @@
 import type { ExtensionAPI, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { HEADLESS_MARKER, isHeadlessSession, promptsFromAllSessions, promptsFromSessions, type SessionLike, userPromptText } from "./history.js";
+import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { HEADLESS_MARKER, isHeadlessSession, promptsFromSessions, userPromptText } from "./history.js";
+import { promptsFromSessionsDir } from "./scan.js";
+import { appendFileSync } from "node:fs";
+
+const debugPath = process.env.PI_HISTORY_DEBUG;
+function debug(message: string): void {
+  if (!debugPath) return;
+  try {
+    appendFileSync(debugPath, `${new Date().toISOString()} ${message}\n`);
+  } catch {
+    // Debug logging must never affect the extension.
+  }
+}
 
 async function loadHistory(reason: SessionStartEvent["reason"], currentPath: string): Promise<string[]> {
   if (reason === "resume") {
@@ -16,18 +29,10 @@ async function loadHistory(reason: SessionStartEvent["reason"], currentPath: str
     }
   }
 
-  const infos = await SessionManager.listAll();
-  const sessions: SessionLike[] = [];
-  for (const info of infos) {
-    if (info.path === currentPath) continue;
-    try {
-      const manager = SessionManager.open(info.path);
-      sessions.push({ path: info.path, modified: info.modified, entries: manager.getEntries() });
-    } catch {
-      // A session can disappear while the global list is being read. Ignore it.
-    }
-  }
-  return promptsFromAllSessions(sessions);
+  // Never open whole sessions here: the global store can be gigabytes, and
+  // SessionManager.open() parses an entire file into memory. Stream instead.
+  const agentDir = getAgentDir();
+  return promptsFromSessionsDir(join(agentDir, "sessions"), join(agentDir, "pi-history-cache.json"), currentPath);
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -35,6 +40,7 @@ export default function (pi: ExtensionAPI): void {
     // Headless runs have no editor to populate. Mark their persisted session so
     // future /new launches do not treat automation prompts as interactive history.
     const entries = ctx.sessionManager.getEntries();
+    debug(`session_start reason=${event.reason} mode=${ctx.mode} hasUI=${ctx.hasUI} file=${ctx.sessionManager.getSessionFile() ?? ""}`);
     if (ctx.mode !== "tui") {
       if (ctx.sessionManager.getSessionFile() && !isHeadlessSession(entries)) {
         pi.appendEntry(HEADLESS_MARKER);
@@ -54,20 +60,47 @@ export default function (pi: ExtensionAPI): void {
     // empty path is fine for /new and startup, and simply cannot match a
     // persisted session path during the global scan.
     const currentPath = ctx.sessionManager.getSessionFile() ?? "";
-    const history = await loadHistory(event.reason, currentPath);
 
-    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-      let seeded = false;
-      return new (class extends CustomEditor {
-        override setText(text: string): void {
-          super.setText(text);
-          if (seeded) return;
-          seeded = true;
-          // addToHistory unshifts, so feed oldest to newest. The native
-          // editor implementation remains the sole owner of history state.
-          for (const prompt of [...history].reverse()) this.addToHistory(prompt);
-        }
-      })(tui, theme, keybindings);
+    // Mount the editor immediately and seed it once the scan resolves, so
+    // startup never waits on disk. On a warm cache this is a few hundred ms;
+    // a cold cache over a multi-gigabyte store streams in the background.
+    let editor: SeededEditor | undefined;
+    let pending: string[] | undefined;
+    const seed = (target: SeededEditor, prompts: string[]): void => {
+      // Anything already in this editor's history was typed in this session
+      // and is newer than every seeded prompt, so it must stay in front.
+      // addToHistory unshifts, so feed oldest to newest: seeded first, then
+      // the existing entries. The native editor owns the history state.
+      const state = target as unknown as { history?: unknown[]; historyIndex?: number };
+      const existing = Array.isArray(state.history) ? (state.history.splice(0) as string[]) : [];
+      for (const prompt of [...prompts].reverse()) target.addToHistory(prompt);
+      for (const prompt of [...existing].reverse()) target.addToHistory(prompt);
+      // If the user is already arrowing through history, keep them on the
+      // same entry: seeded prompts are behind the existing ones, so only the
+      // count of existing entries can shift their position, which is zero.
+      if (typeof state.historyIndex === "number" && state.historyIndex >= existing.length) state.historyIndex = -1;
+    };
+    class SeededEditor extends CustomEditor {
+      constructor(...args: ConstructorParameters<typeof CustomEditor>) {
+        super(...args);
+        editor = this;
+        debug(`editor constructed pending=${pending?.length ?? "none"}`);
+        if (pending) seed(this, pending);
+      }
+    }
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => new SeededEditor(tui, theme, keybindings));
+
+    const started = Date.now();
+    void loadHistory(event.reason, currentPath).then((history) => {
+      pending = history;
+      debug(`history loaded count=${history.length} ms=${Date.now() - started} editor=${editor ? "mounted" : "not-mounted"}`);
+      if (!editor) return;
+      seed(editor, history);
+      const state = editor as unknown as { history?: unknown[] };
+      debug(`seeded editorHistory=${state.history?.length ?? "?"}`);
+    }).catch((error: unknown) => {
+      debug(`history failed ${String(error)}`);
+      // History is a convenience; never surface scan failures as startup errors.
     });
   });
 }

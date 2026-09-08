@@ -1,6 +1,6 @@
 {
   "name": "@hfalconer/pi-history",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Persistent cross-session prompt history for Pi.",
   "keywords": [
     "pi-package"
@@ -28,11 +28,12 @@
     ]
   },
   "scripts": {
-    "build:test": "tsc --ignoreConfig src/history.ts --outDir dist-test --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck",
-    "test": "npm run build:test && node --test test/history.test.mjs",
+    "build:test": "tsc --ignoreConfig src/history.ts src/scan.ts --types node --outDir dist-test --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck",
+    "test": "npm run build:test && node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/node": "^26.5.0",
     "typescript": "^6.0.3"
   }
 }
