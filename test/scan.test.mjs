@@ -82,3 +82,16 @@ test("cache is reused and invalidated on change", async () => {
   await writeFile(path, header + marker(INTERACTIVE_MARKER) + user("fresh", "2024-01-09T00:00:00Z"));
   assert.deepEqual(await promptsFromSessionsDir(root, cache, undefined, SINCE), ["fresh", "ok2", "ok1", "solo"]);
 });
+
+test("keeps up to 1000 prompts, newest first", async () => {
+  const { MAX_PROMPTS } = await import("../dist-test/scan.js");
+  assert.equal(MAX_PROMPTS, 1000);
+  const { dir, cache, root } = await fixture();
+  let body = header + marker(INTERACTIVE_MARKER);
+  for (let i = 0; i < 1200; i++) body += user(`p${i}`, new Date(Date.UTC(2024, 5, 1, 0, 0, i)).toISOString());
+  await writeFile(join(root, "--proj--", "big.jsonl"), body);
+  const all = await promptsFromSessionsDir(root, cache, undefined, SINCE);
+  assert.equal(all.length, 1000);
+  assert.equal(all[0], "p1199");
+  assert.equal(all[999], "p200");
+});

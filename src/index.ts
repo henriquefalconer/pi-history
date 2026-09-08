@@ -3,7 +3,7 @@ import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { HEADLESS_MARKER, INTERACTIVE_MARKER, isHeadlessSession, markerKind, promptsFromSessions, userPromptText } from "./history.js";
-import { promptsFromSessionsDir } from "./scan.js";
+import { MAX_PROMPTS, promptsFromSessionsDir } from "./scan.js";
 import { appendFileSync } from "node:fs";
 
 const debugPath = process.env.PI_HISTORY_DEBUG;
@@ -93,6 +93,21 @@ export default function (pi: ExtensionAPI): void {
         editor = this;
         debug(`editor constructed pending=${pending?.length ?? "none"}`);
         if (pending) seed(this, pending);
+      }
+
+      /**
+       * Same semantics as the native implementation (trim, skip consecutive
+       * duplicates, newest first) with a larger limit. The native editor caps
+       * history at 100 entries, which would discard most seeded prompts.
+       */
+      override addToHistory(text: string): void {
+        const trimmed = text.trim();
+        if (!trimmed) return;
+        const state = this as unknown as { history?: string[] };
+        if (!Array.isArray(state.history)) return super.addToHistory(text);
+        if (state.history[0] === trimmed) return;
+        state.history.unshift(trimmed);
+        if (state.history.length > MAX_PROMPTS) state.history.length = MAX_PROMPTS;
       }
     }
     ctx.ui.setEditorComponent((tui, theme, keybindings) => new SeededEditor(tui, theme, keybindings));

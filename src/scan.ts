@@ -5,17 +5,17 @@ import { createInterface } from "node:readline";
 import { includeInGlobalHistory, markerKind, type SessionKind, userPromptText } from "./history.js";
 
 /**
- * Upper bound on prompts seeded into the editor. Pi's Editor keeps at most 100
- * history entries, so anything beyond that would be discarded immediately.
+ * Upper bound on prompts seeded into the editor. Pi's native Editor keeps 100
+ * entries; the seeded editor raises its own limit to match this value.
  * A session's prompts are monotonic in time, so keeping only its newest
  * MAX_PROMPTS entries in the cache can never change the global result.
  */
-export const MAX_PROMPTS = 100;
+export const MAX_PROMPTS = 1000;
 /** Lines longer than this can't be prompts worth seeding; skip parsing them. */
 const MAX_LINE_BYTES = 256 * 1024;
 /** How many session files to stream concurrently on a cold cache. */
 const CONCURRENCY = 16;
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const MARKER_PREFIX = "hfalconer/pi-history:";
 
 export type PromptRecord = { prompt: string; timestamp: number };
