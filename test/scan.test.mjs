@@ -7,7 +7,7 @@ import { HEADLESS_MARKER, INTERACTIVE_MARKER, includeInGlobalHistory } from "../
 import { promptsFromSessionsDir, scanSession } from "../dist-test/scan.js";
 
 const line = (obj) => JSON.stringify(obj) + "\n";
-const header = line({ type: "session", version: 3 });
+const header = line({ type: "session", version: 3, id: "sid", cwd: "/proj", timestamp: "2024-01-01T00:00:00Z" });
 const user = (text, ts) => line({ type: "message", timestamp: ts, message: { role: "user", content: [{ type: "text", text }] } });
 const assistant = (text) => line({ type: "message", timestamp: "2024-01-01T00:00:00Z", message: { role: "assistant", content: [{ type: "text", text }] } });
 const marker = (customType) => line({ type: "custom", customType });
@@ -45,7 +45,8 @@ test("streams user prompts and reports marker kind", async () => {
   const { sessions } = await fixture();
   const a = await scanSession(join(sessions, "a.jsonl"), 0);
   assert.deepEqual({ kind: a.kind, prompts: a.prompts.map((r) => r.prompt), count: a.promptCount }, { kind: "unknown", prompts: ["a1", "a2"], count: 2 });
-  assert.deepEqual(await scanSession(join(sessions, "headless.jsonl"), 0), { kind: "headless", promptCount: 0, prompts: [] });
+  const headless = await scanSession(join(sessions, "headless.jsonl"), 0);
+  assert.deepEqual({ kind: headless.kind, promptCount: headless.promptCount, prompts: headless.prompts, search: headless.search }, { kind: "headless", promptCount: 0, prompts: [], search: "" });
   assert.equal((await scanSession(join(sessions, "interactive.jsonl"), 0)).kind, "interactive");
 });
 
@@ -96,15 +97,37 @@ test("keeps up to 1000 prompts, newest first", async () => {
   assert.equal(all[999], "p200");
 });
 
-test("filterInteractiveSessions keeps interactive and current sessions only", async () => {
-  const { filterInteractiveSessions } = await import("../dist-test/scan.js");
-  const { sessions, cache, root } = await fixture();
-  const list = ["a", "forks/b", "headless", "interactive", "broken", "missing"].map((n) => ({ path: join(sessions, `${n}.jsonl`), name: n }));
-  const kept = (await filterInteractiveSessions(list, cache, join(sessions, "forks/b.jsonl"), SINCE)).map((s) => s.name);
-  assert.deepEqual(kept, ["a", "forks/b", "interactive", "broken", "missing"]);
-  // The partial listing must not prune cache entries the full scan relies on.
-  const full = await promptsFromSessionsDir(root, cache, undefined, SINCE);
-  assert.deepEqual(full, ["ok2", "ok1", "solo", "a2", "a1"]);
+test("listInteractiveSessions builds Pi's selector entries from the cache", async () => {
+  const { listInteractiveSessions, statSessionFiles } = await import("../dist-test/scan.js");
+  const { sessions, cache } = await fixture();
+  const path = join(sessions, "named.jsonl");
+  await writeFile(path, header + marker(INTERACTIVE_MARKER) + user("hello", "2024-02-01T00:00:00Z") + assistant("world")
+    + line({ type: "session_info", name: " My Session " })
+    + line({ type: "message", timestamp: "2024-02-02T00:00:00Z", message: { role: "toolResult", content: [{ type: "text", text: "tool" }] } })
+    + line({ type: "message", timestamp: "2024-02-03T00:00:00Z", message: { role: "assistant", content: [{ type: "text", text: "later" }], timestamp: 1706918400000 } }));
+  await utimes(path, OLD, OLD);
+  const progress = [];
+  const listed = await listInteractiveSessions(await statSessionFiles(sessions), cache, (l, t) => progress.push([l, t]), SINCE);
+  assert.deepEqual(listed.map((s) => s.path.split("/").pop()), ["named.jsonl", "broken.jsonl", "interactive.jsonl", "a.jsonl"].filter((n) => n !== "broken.jsonl"));
+  const named = listed[0];
+  assert.equal(named.id, "sid");
+  assert.equal(named.cwd, "/proj");
+  assert.equal(named.name, "My Session");
+  assert.equal(named.messageCount, 4);
+  assert.equal(named.firstMessage, "hello");
+  assert.equal(named.modified.getTime(), 1706918400000);
+  assert.equal(named.created.toISOString(), "2024-01-01T00:00:00.000Z");
+  assert.equal(named.allMessagesText, "hello world later");
+  assert.deepEqual(progress, [[3, 3]]);
+  // Excluded sessions carry no search text in the cache; the partial listing did not prune.
   const cached = JSON.parse(await readFile(cache, "utf8"));
-  assert.equal(Object.keys(cached.sessions).length, 5);
+  assert.equal(cached.sessions[join(sessions, "headless.jsonl")].search, undefined);
+  assert.equal(typeof cached.sessions[path].search, "string");
+  const full = await promptsFromSessionsDir(join(sessions, ".."), cache, undefined, SINCE);
+  assert.equal(full[0], "hello");
+});
+
+test("defaultSessionDir mirrors Pi's encoding", async () => {
+  const { defaultSessionDir } = await import("../dist-test/scan.js");
+  assert.equal(defaultSessionDir("/agent/sessions", "/home/x/code:y"), "/agent/sessions/--home-x-code-y--");
 });

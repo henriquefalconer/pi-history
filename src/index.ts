@@ -1,9 +1,9 @@
 import type { ExtensionAPI, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { HEADLESS_MARKER, INTERACTIVE_MARKER, isHeadlessSession, markerKind, promptsFromSessions, userPromptText } from "./history.js";
-import { MAX_PROMPTS, filterInteractiveSessions, promptsFromSessionsDir } from "./scan.js";
+import { MAX_PROMPTS, defaultSessionDir, listInteractiveSessions, promptsFromSessionsDir, statAllSessionFiles, statSessionFiles } from "./scan.js";
 import { appendFileSync } from "node:fs";
 
 const debugPath = process.env.PI_HISTORY_DEBUG;
@@ -36,40 +36,49 @@ async function loadHistory(reason: SessionStartEvent["reason"], currentPath: str
 }
 
 const PATCHED = Symbol.for("hfalconer/pi-history:session-list-patched");
+type Progress = ((loaded: number, total: number) => void) | undefined;
 
 /**
  * Pi has no hook for the /resume list, and its keyboard shortcut bypasses
- * slash commands, so wrap SessionManager's static listings once. The wrap is
- * process-wide and idempotent across extension reloads.
+ * slash commands, so replace SessionManager's static listings once. Pi's own
+ * listing streams every session in full; ours answers from the cache and only
+ * reads sessions that changed. Custom session directories fall back to Pi.
+ * The replacement is process-wide and idempotent across extension reloads.
  */
-function filterResumeList(cachePath: string, currentPath: () => string | undefined): void {
+function replaceSessionListings(sessionsDir: string, cachePath: string): void {
   const target = SessionManager as unknown as Record<PropertyKey, unknown>;
   if (target[PATCHED]) return;
   target[PATCHED] = true;
-  for (const name of ["list", "listAll"] as const) {
-    const original = SessionManager[name] as (...args: unknown[]) => Promise<{ path: string }[]>;
-    target[name] = async function (this: unknown, ...args: unknown[]) {
-      const sessions = await original.apply(this, args);
-      const started = Date.now();
-      try {
-        const kept = await filterInteractiveSessions(sessions, cachePath, currentPath());
-        debug(`${name} filtered ${sessions.length} -> ${kept.length} in ${Date.now() - started}ms`);
-        return kept;
-      } catch (error) {
-        debug(`${name} filter failed ${String(error)}`);
-        return sessions;
-      }
-    };
-  }
+  const originalList = SessionManager.list.bind(SessionManager);
+  const originalListAll = SessionManager.listAll.bind(SessionManager);
+  const timed = async <T>(label: string, work: () => Promise<T[]>, fallback: () => Promise<T[]>): Promise<T[]> => {
+    const started = Date.now();
+    try {
+      const result = await work();
+      debug(`${label} listed ${result.length} in ${Date.now() - started}ms`);
+      return result;
+    } catch (error) {
+      debug(`${label} failed, falling back: ${String(error)}`);
+      return fallback();
+    }
+  };
+  target.list = (cwd: string, sessionDir?: string, onProgress?: Progress) => {
+    const dir = defaultSessionDir(sessionsDir, cwd);
+    if (sessionDir !== undefined && resolve(sessionDir) !== dir) return originalList(cwd, sessionDir, onProgress);
+    return timed("list", async () => listInteractiveSessions(await statSessionFiles(dir), cachePath, onProgress), () => originalList(cwd, sessionDir, onProgress));
+  };
+  target.listAll = (dirOrProgress?: string | Progress, onProgress?: Progress) => {
+    if (typeof dirOrProgress === "string" && resolve(dirOrProgress) !== sessionsDir) return originalListAll(dirOrProgress, onProgress);
+    const progress = typeof dirOrProgress === "function" ? dirOrProgress : onProgress;
+    return timed("listAll", async () => listInteractiveSessions(await statAllSessionFiles(sessionsDir), cachePath, progress), () => originalListAll(progress));
+  };
 }
 
 export default function (pi: ExtensionAPI): void {
-  let currentSessionFile: string | undefined;
   pi.on("session_start", async (event: SessionStartEvent, ctx) => {
     // Headless runs have no editor to populate. Mark their persisted session so
     // future /new launches do not treat automation prompts as interactive history.
     const entries = ctx.sessionManager.getEntries();
-    currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
     debug(`session_start reason=${event.reason} mode=${ctx.mode} hasUI=${ctx.hasUI} file=${ctx.sessionManager.getSessionFile() ?? ""}`);
     if (ctx.mode !== "tui") {
       if (ctx.sessionManager.getSessionFile() && !isHeadlessSession(entries)) {
@@ -78,7 +87,7 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    filterResumeList(join(getAgentDir(), "pi-history-cache.json"), () => currentSessionFile);
+    replaceSessionListings(join(getAgentDir(), "sessions"), join(getAgentDir(), "pi-history-cache.json"));
 
     // Mark interactive sessions positively. Headless runs started with
     // --no-extensions never load this extension, so the global scan treats
