@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -19,7 +20,7 @@ const MAX_SEARCH_BYTES = 64 * 1024;
 const MAX_FIRST_MESSAGE_CHARS = 500;
 /** How many session files to stream concurrently on a cold cache. */
 const CONCURRENCY = 16;
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 const MARKER_PREFIX = "hfalconer/pi-history:";
 
 export type PromptRecord = { prompt: string; timestamp: number };
@@ -34,7 +35,44 @@ export type SessionSummary = {
   messageCount: number;
   firstMessage: string;
 };
-export type SessionScan = { kind: SessionKind; promptCount: number; prompts: PromptRecord[]; summary?: SessionSummary; search: string };
+export type SessionScan = { kind: SessionKind; promptCount: number; prompts: PromptRecord[]; summary?: SessionSummary; search: string; hasCompaction?: boolean };
+
+/** Unmarked compacted sessions cannot be distinguished from automation. Fail closed. */
+function includeInResume(session: Pick<SessionScan, "kind" | "promptCount" | "hasCompaction">, modified: number, markerSince: number): boolean {
+  if (session.hasCompaction && session.kind === "unknown") return false;
+  return includeInGlobalHistory(session.kind, session.promptCount, modified, markerSince);
+}
+
+function kindPath(cachePath: string, sessionPath: string): string {
+  const key = createHash("sha256").update(resolve(sessionPath)).digest("hex");
+  return join(dirname(cachePath), "pi-history-kinds", `${key}.json`);
+}
+
+/** Separate from transcripts and the disposable scan cache so compaction cannot erase it. */
+export async function rememberSessionKind(cachePath: string, sessionPath: string, id: string, kind: Exclude<SessionKind, "unknown">): Promise<void> {
+  const path = kindPath(cachePath, sessionPath);
+  await mkdir(dirname(path), { recursive: true });
+  const previous = await recalledSessionKind(cachePath, sessionPath, id);
+  const savedKind = previous === "headless" ? previous : kind;
+  // Separate headless evidence prevents a concurrent TUI writer from overwriting it.
+  const target = savedKind === "headless" ? `${path}.headless` : path;
+  const tmp = `${target}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  await writeFile(tmp, JSON.stringify({ id, kind: savedKind }));
+  await rename(tmp, target);
+}
+
+async function recalledSessionKind(cachePath: string, sessionPath: string, id: string): Promise<SessionKind> {
+  const path = kindPath(cachePath, sessionPath);
+  for (const candidate of [`${path}.headless`, path]) {
+    try {
+      const saved = JSON.parse(await readFile(candidate, "utf8"));
+      if (saved.id === id && (saved.kind === "interactive" || saved.kind === "headless")) return saved.kind;
+    } catch {
+      // Missing or corrupt classification is not proof of an interactive session.
+    }
+  }
+  return "unknown";
+}
 type CachedSession = Omit<SessionScan, "search"> & { size: number; mtime: number; search?: string };
 type Cache = { version: number; markerSince: number; sessions: Record<string, CachedSession> };
 type FileInfo = { path: string; size: number; mtime: number };
@@ -88,6 +126,8 @@ export async function scanSession(path: string, modified: number): Promise<Sessi
   let lastActivity: number | undefined;
   let messageCount = 0;
   let firstMessage = "";
+  let compactionText = "";
+  let hasCompaction = false;
   let search = "";
   let first = true;
   const rl = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
@@ -115,18 +155,28 @@ export async function scanSession(path: string, modified: number): Promise<Sessi
       }
       const isMessage = line.startsWith('{"type":"message"');
       if (isMessage) messageCount++;
+      const isCompaction = line.startsWith('{"type":"compaction"');
+      // Even a summary too large to parse must not trigger the legacy prompt-count heuristic.
+      if (isCompaction) hasCompaction = true;
       if (line.length > MAX_LINE_BYTES) continue;
       const isUser = isMessage && line.includes('"role":"user"');
       const isAssistant = isMessage && !isUser && line.includes('"role":"assistant"');
       const isInfo = line.startsWith('{"type":"session_info"');
-      if (!isUser && !isAssistant && !isInfo && !line.includes(MARKER_PREFIX)) continue;
+      if (!isUser && !isAssistant && !isInfo && !isCompaction && !line.includes(MARKER_PREFIX)) continue;
       let entry: unknown;
       try {
         entry = JSON.parse(line);
       } catch {
         continue;
       }
-      const candidate = entry as { type?: unknown; name?: unknown; timestamp?: unknown; message?: MessageLike };
+      const candidate = entry as { type?: unknown; name?: unknown; timestamp?: unknown; message?: MessageLike; summary?: unknown };
+      if (candidate.type === "compaction" && typeof candidate.summary === "string") {
+        hasCompaction = true;
+        compactionText = candidate.summary.slice(0, MAX_SEARCH_BYTES);
+        const activity = typeof candidate.timestamp === "string" ? Date.parse(candidate.timestamp) : Number.NaN;
+        if (Number.isFinite(activity)) lastActivity = Math.max(lastActivity ?? 0, activity);
+        continue;
+      }
       if (isInfo) {
         if (summary) summary.name = typeof candidate.name === "string" && candidate.name.trim() ? candidate.name.trim() : undefined;
         continue;
@@ -153,15 +203,20 @@ export async function scanSession(path: string, modified: number): Promise<Sessi
   } finally {
     rl.close();
   }
-  if (summary) Object.assign(summary, { lastActivity, messageCount, firstMessage });
-  return { kind, promptCount, prompts, summary, search };
+  if (summary) Object.assign(summary, { lastActivity, messageCount, firstMessage: firstMessage || compactionText.slice(0, MAX_FIRST_MESSAGE_CHARS) });
+  search = [search, compactionText].filter(Boolean).join(" ").slice(0, MAX_SEARCH_BYTES);
+  return { kind, promptCount, prompts, summary, search, hasCompaction };
 }
 
 async function readCache(cachePath: string): Promise<Cache> {
   try {
     const parsed = JSON.parse(await readFile(cachePath, "utf8")) as Cache;
-    if (parsed?.version === CACHE_VERSION && parsed.sessions && typeof parsed.sessions === "object" &&
-      typeof parsed.markerSince === "number") return parsed;
+    if (parsed?.sessions && typeof parsed.sessions === "object" && typeof parsed.markerSince === "number") {
+      if (parsed.version === CACHE_VERSION) return parsed;
+      // Re-scan older caches without moving the headless-classification cutoff.
+      return { version: CACHE_VERSION, markerSince: parsed.markerSince,
+        sessions: Object.fromEntries(Object.entries(parsed.sessions).map(([path, cached]) => [path, { ...cached, size: -1 }])) };
+    }
   } catch {
     // Missing or corrupt cache: rebuild from scratch.
   }
@@ -211,7 +266,21 @@ async function syncCache(files: FileInfo[], cachePath: string, options: { prune:
   const stale = files.filter((file) => !fresh(file));
   const scanned = await mapLimit(stale, CONCURRENCY, async (file) => {
     try {
-      return { file, scan: await scanSession(file.path, file.mtime) };
+      const scan = await scanSession(file.path, file.mtime);
+      if (scan.summary) {
+        let saved = await recalledSessionKind(cachePath, file.path, scan.summary.id);
+        const previous = cache.sessions[file.path];
+        if (saved === "unknown" && previous?.summary?.id === scan.summary.id) saved = previous.kind;
+        if (saved === "headless" || scan.kind === "unknown") scan.kind = saved;
+        if (scan.kind !== "unknown") {
+          try {
+            await rememberSessionKind(cachePath, file.path, scan.summary.id, scan.kind);
+          } catch {
+            // A read-only cache must not hide an explicitly marked session.
+          }
+        }
+      }
+      return { file, scan };
     } catch {
       return null;
     }
@@ -228,12 +297,12 @@ async function syncCache(files: FileInfo[], cachePath: string, options: { prune:
   for (const result of scanned) {
     if (!result) continue;
     const { size, mtime } = result.file;
-    const { kind, promptCount, prompts, summary, search } = result.scan;
+    const { kind, promptCount, prompts, summary, search, hasCompaction } = result.scan;
     // Sessions that never surface keep only what classification needs, so the
     // cache stays proportional to the sessions the user actually sees.
-    sessions[result.file.path] = includeInGlobalHistory(kind, promptCount, mtime, markerSince)
-      ? { size, mtime, kind, promptCount, prompts, summary, search }
-      : { size, mtime, kind, promptCount, prompts: [] };
+    sessions[result.file.path] = includeInResume(result.scan, mtime, markerSince)
+      ? { size, mtime, kind, promptCount, hasCompaction, prompts, summary, search }
+      : { size, mtime, kind, promptCount, hasCompaction, prompts: [] };
   }
   const next: Cache = { version: CACHE_VERSION, markerSince, sessions };
   const changed = markerSince !== cache.markerSince || stale.length > 0 ||
@@ -276,7 +345,7 @@ export async function listInteractiveSessions(files: FileInfo[], cachePath: stri
   const listed: ListedSession[] = [];
   for (const file of files) {
     const cached = cache.sessions[file.path];
-    if (!cached?.summary || !includeInGlobalHistory(cached.kind, cached.promptCount, file.mtime, markerSince)) continue;
+    if (!cached?.summary || !includeInResume(cached, file.mtime, markerSince)) continue;
     const { created, lastActivity, ...summary } = cached.summary;
     const modified = lastActivity && lastActivity > 0 ? lastActivity : created;
     listed.push({

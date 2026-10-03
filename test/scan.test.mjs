@@ -127,6 +127,93 @@ test("listInteractiveSessions builds Pi's selector entries from the cache", asyn
   assert.equal(full[0], "hello");
 });
 
+test("only known interactive compacted sessions remain resumable, cold and warm", async () => {
+  const { listInteractiveSessions, statSessionFiles, rememberSessionKind } = await import("../dist-test/scan.js");
+  const { sessions, cache, root } = await fixture();
+  const compact = line({ type: "compaction", id: "c", parentId: null, firstKeptEntryId: "c",
+    timestamp: "2026-01-02T00:00:00Z", summary: "Research clone plan after compaction" });
+  const cases = {
+    compacted: header + compact,
+    continued: header + compact + user("continue", "2026-01-03T00:00:00Z"),
+    marked: header + marker(INTERACTIVE_MARKER) + compact,
+    headlessBefore: header + marker(HEADLESS_MARKER) + compact,
+    headlessAfter: header + compact + marker(HEADLESS_MARKER),
+    noHeader: compact,
+    malformed: header + '{"type":"compaction","summary":\n',
+    notCompaction: header + assistant('a tool mentioned "type":"compaction"'),
+  };
+  cases.unknown = header + compact + user("unknown1", "2026-01-03T00:00:00Z") + user("unknown2", "2026-01-04T00:00:00Z");
+  cases.headlessLostMarker = header + compact;
+  cases.oversized = header + line({ type: "compaction", summary: "x".repeat(1024 * 1024) })
+    + user("auto1", "2024-01-01T00:00:00Z") + user("auto2", "2024-01-02T00:00:00Z");
+  for (const [name, body] of Object.entries(cases)) await writeFile(join(sessions, `${name}.jsonl`), body);
+  await utimes(join(sessions, "unknown.jsonl"), OLD, OLD);
+  await utimes(join(sessions, "oversized.jsonl"), OLD, OLD);
+  await rememberSessionKind(cache, join(sessions, "compacted.jsonl"), "sid", "interactive");
+  await rememberSessionKind(cache, join(sessions, "continued.jsonl"), "sid", "interactive");
+  await rememberSessionKind(cache, join(sessions, "headlessLostMarker.jsonl"), "sid", "headless");
+  for (let pass = 0; pass < 2; pass++) {
+    const listed = await listInteractiveSessions(await statSessionFiles(sessions), cache, undefined, SINCE);
+    for (const name of Object.keys(cases)) {
+      assert.equal(listed.some((s) => s.path === join(sessions, `${name}.jsonl`)),
+        ["compacted", "continued", "marked"].includes(name), `${name}, pass ${pass}`);
+    }
+    const compacted = listed.find((s) => s.path === join(sessions, "compacted.jsonl"));
+    assert.equal(compacted.firstMessage, "Research clone plan after compaction");
+    assert.equal(compacted.allMessagesText, compacted.firstMessage);
+    assert.equal(compacted.modified.toISOString(), "2026-01-02T00:00:00.000Z");
+    assert.equal(compacted.messageCount, 0);
+    const continued = listed.find((s) => s.path === join(sessions, "continued.jsonl"));
+    assert.equal(continued.firstMessage, "continue");
+    assert.match(continued.allMessagesText, /Research clone plan/);
+    const prompts = await promptsFromSessionsDir(root, cache, undefined, SINCE);
+    assert.ok(prompts.includes("continue"));
+    assert.ok(!prompts.some((p) => p.includes("Research clone plan")));
+  }
+});
+
+test("upgrading the cache rescans compacted sessions without resetting markerSince", async () => {
+  const { listInteractiveSessions, statSessionFiles } = await import("../dist-test/scan.js");
+  const { sessions, cache } = await fixture();
+  const path = join(sessions, "compacted.jsonl");
+  await writeFile(path, header + line({ type: "compaction", summary: "Recovered plan" }));
+  const files = await statSessionFiles(sessions);
+  const file = files.find((f) => f.path === path);
+  await writeFile(cache, JSON.stringify({ version: 4, markerSince: SINCE, sessions: {
+    [path]: { size: file.size, mtime: file.mtime, kind: "interactive", promptCount: 0, prompts: [], summary: { id: "sid" } },
+  } }));
+  const listed = await listInteractiveSessions(files, cache, undefined, SINCE + 10000);
+  assert.ok(listed.some((s) => s.path === path));
+  const persisted = JSON.parse(await readFile(cache, "utf8"));
+  assert.equal(persisted.version, 5);
+  assert.equal(persisted.markerSince, SINCE);
+});
+
+test("classification survives marker removal and cache deletion, but not a replaced session ID", async () => {
+  const { listInteractiveSessions, statSessionFiles, rememberSessionKind } = await import("../dist-test/scan.js");
+  const { unlink } = await import("node:fs/promises");
+  const { sessions, cache } = await fixture();
+  const interactive = join(sessions, "durable.jsonl");
+  const headless = join(sessions, "automation.jsonl");
+  await writeFile(interactive, header + marker(INTERACTIVE_MARKER));
+  await writeFile(headless, header + marker(HEADLESS_MARKER));
+  await listInteractiveSessions(await statSessionFiles(sessions), cache, undefined, SINCE);
+  const compact = line({ type: "compaction", summary: "Retained summary" });
+  await writeFile(interactive, header + compact);
+  await writeFile(headless, header + compact);
+  await unlink(cache);
+  // A later TUI visit cannot reclassify a known headless run.
+  await Promise.all([
+    rememberSessionKind(cache, headless, "sid", "interactive"),
+    rememberSessionKind(cache, headless, "sid", "headless"),
+  ]);
+  const listed = await listInteractiveSessions(await statSessionFiles(sessions), cache, undefined, SINCE);
+  assert.ok(listed.some((s) => s.path === interactive));
+  assert.ok(!listed.some((s) => s.path === headless));
+  await writeFile(interactive, header.replace('"sid"', '"replacement"') + compact);
+  assert.ok(!(await listInteractiveSessions(await statSessionFiles(sessions), cache, undefined, SINCE)).some((s) => s.path === interactive));
+});
+
 test("defaultSessionDir mirrors Pi's encoding", async () => {
   const { defaultSessionDir } = await import("../dist-test/scan.js");
   assert.equal(defaultSessionDir("/agent/sessions", "/home/x/code:y"), "/agent/sessions/--home-x-code-y--");

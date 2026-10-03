@@ -3,7 +3,7 @@ import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join, resolve } from "node:path";
 import { HEADLESS_MARKER, INTERACTIVE_MARKER, isHeadlessSession, markerKind, promptsFromSessions, userPromptText } from "./history.js";
-import { MAX_PROMPTS, defaultSessionDir, listInteractiveSessions, promptsFromSessionsDir, statAllSessionFiles, statSessionFiles } from "./scan.js";
+import { MAX_PROMPTS, defaultSessionDir, listInteractiveSessions, promptsFromSessionsDir, rememberSessionKind, statAllSessionFiles, statSessionFiles } from "./scan.js";
 import { appendFileSync } from "node:fs";
 
 const debugPath = process.env.PI_HISTORY_DEBUG;
@@ -45,12 +45,13 @@ type Progress = ((loaded: number, total: number) => void) | undefined;
  * reads sessions that changed. Custom session directories fall back to Pi.
  * The replacement is process-wide and idempotent across extension reloads.
  */
-function replaceSessionListings(sessionsDir: string, cachePath: string): void {
-  const target = SessionManager as unknown as Record<PropertyKey, unknown>;
+function replaceSessionListings(managerClass: typeof SessionManager, sessionsDir: string, cachePath: string): void {
+  const target = managerClass as unknown as Record<PropertyKey, unknown>;
   if (target[PATCHED]) return;
+  debug(`patch listings class=${managerClass.name} sessionsDir=${sessionsDir}`);
   target[PATCHED] = true;
-  const originalList = SessionManager.list.bind(SessionManager);
-  const originalListAll = SessionManager.listAll.bind(SessionManager);
+  const originalList = managerClass.list.bind(managerClass);
+  const originalListAll = managerClass.listAll.bind(managerClass);
   const timed = async <T>(label: string, work: () => Promise<T[]>, fallback: () => Promise<T[]>): Promise<T[]> => {
     const started = Date.now();
     try {
@@ -64,7 +65,11 @@ function replaceSessionListings(sessionsDir: string, cachePath: string): void {
   };
   target.list = (cwd: string, sessionDir?: string, onProgress?: Progress) => {
     const dir = defaultSessionDir(sessionsDir, cwd);
-    if (sessionDir !== undefined && resolve(sessionDir) !== dir) return originalList(cwd, sessionDir, onProgress);
+    // In-memory sessions pass an empty directory; Pi treats it as the default.
+    if (sessionDir && resolve(sessionDir) !== dir) {
+      debug(`list custom-dir fallback cwd=${cwd} supplied=${sessionDir} default=${dir}`);
+      return originalList(cwd, sessionDir, onProgress);
+    }
     return timed("list", async () => listInteractiveSessions(await statSessionFiles(dir), cachePath, onProgress), () => originalList(cwd, sessionDir, onProgress));
   };
   target.listAll = (dirOrProgress?: string | Progress, onProgress?: Progress) => {
@@ -80,6 +85,15 @@ export default function (pi: ExtensionAPI): void {
     // future /new launches do not treat automation prompts as interactive history.
     const entries = ctx.sessionManager.getEntries();
     debug(`session_start reason=${event.reason} mode=${ctx.mode} hasUI=${ctx.hasUI} file=${ctx.sessionManager.getSessionFile() ?? ""}`);
+    const sessionPath = ctx.sessionManager.getSessionFile();
+    if (sessionPath) {
+      try {
+        await rememberSessionKind(join(getAgentDir(), "pi-history-cache.json"), sessionPath,
+          ctx.sessionManager.getSessionId(), ctx.mode === "tui" && !isHeadlessSession(entries) ? "interactive" : "headless");
+      } catch (error) {
+        debug(`could not persist session kind: ${String(error)}`);
+      }
+    }
     if (ctx.mode !== "tui") {
       if (ctx.sessionManager.getSessionFile() && !isHeadlessSession(entries)) {
         pi.appendEntry(HEADLESS_MARKER);
@@ -87,7 +101,10 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    replaceSessionListings(join(getAgentDir(), "sessions"), join(getAgentDir(), "pi-history-cache.json"));
+    // A local development SDK can export another copy of SessionManager.
+    // Patch the class that owns Pi's running session, not that imported copy.
+    const managerClass = ctx.sessionManager.constructor as typeof SessionManager;
+    replaceSessionListings(managerClass, join(getAgentDir(), "sessions"), join(getAgentDir(), "pi-history-cache.json"));
 
     // Mark interactive sessions positively. Headless runs started with
     // --no-extensions never load this extension, so the global scan treats
