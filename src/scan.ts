@@ -61,6 +61,22 @@ export async function rememberSessionKind(cachePath: string, sessionPath: string
   await rename(tmp, target);
 }
 
+/** Validate an explicit recovery request without changing the transcript or classification. */
+export async function inspectRecoverySession(sessionPath: string, cachePath: string): Promise<SessionSummary> {
+  const info = await stat(sessionPath);
+  if (!info.isFile() || !sessionPath.endsWith(".jsonl")) throw new Error("Choose an existing .jsonl session file.");
+  const scan = await scanSession(sessionPath, info.mtimeMs);
+  if (!scan.summary) throw new Error("The file has no valid Pi session header.");
+  const saved = await recalledSessionKind(cachePath, sessionPath, scan.summary.id);
+  // Older versions may have recorded headless evidence only in the scan cache.
+  const cached = (await readCache(cachePath)).sessions[sessionPath];
+  if (scan.kind === "headless" || saved === "headless" ||
+      (cached?.summary?.id === scan.summary.id && cached.kind === "headless")) {
+    throw new Error("Known headless sessions cannot be recovered into interactive history.");
+  }
+  return scan.summary;
+}
+
 async function recalledSessionKind(cachePath: string, sessionPath: string, id: string): Promise<SessionKind> {
   const path = kindPath(cachePath, sessionPath);
   for (const candidate of [`${path}.headless`, path]) {

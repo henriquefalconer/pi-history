@@ -3,7 +3,7 @@ import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import { SessionManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join, resolve } from "node:path";
 import { HEADLESS_MARKER, INTERACTIVE_MARKER, isHeadlessSession, markerKind, promptsFromSessions, userPromptText } from "./history.js";
-import { MAX_PROMPTS, defaultSessionDir, listInteractiveSessions, promptsFromSessionsDir, rememberSessionKind, statAllSessionFiles, statSessionFiles } from "./scan.js";
+import { MAX_PROMPTS, defaultSessionDir, inspectRecoverySession, listInteractiveSessions, promptsFromSessionsDir, rememberSessionKind, statAllSessionFiles, statSessionFiles } from "./scan.js";
 import { appendFileSync } from "node:fs";
 
 const debugPath = process.env.PI_HISTORY_DEBUG;
@@ -80,6 +80,34 @@ function replaceSessionListings(managerClass: typeof SessionManager, sessionsDir
 }
 
 export default function (pi: ExtensionAPI): void {
+  pi.registerCommand("history-recover", {
+    description: "Resume an unmarked session hidden by /resume: /history-recover <absolute .jsonl path>",
+    handler: async (args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("Session recovery requires Pi's terminal UI.", "error");
+        return;
+      }
+      const input = args.trim();
+      if (!input) {
+        ctx.ui.notify("Usage: /history-recover <absolute .jsonl path>", "info");
+        return;
+      }
+      const path = resolve(ctx.cwd, input);
+      let summary;
+      try {
+        summary = await inspectRecoverySession(path, join(getAgentDir(), "pi-history-cache.json"));
+      } catch (error) {
+        ctx.ui.notify(`Cannot recover session: ${String(error)}`, "error");
+        return;
+      }
+      if (!await ctx.ui.confirm("Recover interactive session?", `${summary.name || summary.firstMessage || summary.id}\n${path}\nOnly confirm if this was an interactive conversation.`)) return;
+      // Use Pi's session lifecycle. session_start persists both the interactive
+      // marker and classification, so the next cached /resume scan sees it.
+      // Do not reuse ctx after replacement or send a model prompt.
+      await ctx.switchSession(path);
+    },
+  });
+
   pi.on("session_start", async (event: SessionStartEvent, ctx) => {
     // Headless runs have no editor to populate. Mark their persisted session so
     // future /new launches do not treat automation prompts as interactive history.

@@ -214,6 +214,42 @@ test("classification survives marker removal and cache deletion, but not a repla
   assert.ok(!(await listInteractiveSessions(await statSessionFiles(sessions), cache, undefined, SINCE)).some((s) => s.path === interactive));
 });
 
+test("recovery validates unmarked compacted sessions without mutating them", async () => {
+  const { inspectRecoverySession, listInteractiveSessions, statSessionFiles } = await import("../dist-test/scan.js");
+  const { sessions, cache } = await fixture();
+  const path = join(sessions, "missing.jsonl");
+  const body = header + user("study the commits", "2026-01-01T00:00:00Z") +
+    line({ type: "compaction", summary: "Earlier work" }) +
+    Array.from({ length: 12 }, (_, i) => user(`follow up ${i}`, "2026-01-02T00:00:00Z")).join("") +
+    line({ type: "compaction", summary: "Later work" }) + user("push", "2026-01-03T00:00:00Z");
+  await writeFile(path, body);
+  assert.ok(!(await listInteractiveSessions(await statSessionFiles(sessions), cache)).some((s) => s.path === path));
+  assert.equal((await inspectRecoverySession(path, cache)).firstMessage, "study the commits");
+  assert.equal(await readFile(path, "utf8"), body);
+  // Merely inspecting or cancelling the confirmation must not classify it.
+  assert.ok(!(await listInteractiveSessions(await statSessionFiles(sessions), cache)).some((s) => s.path === path));
+  await assert.rejects(inspectRecoverySession(join(sessions, "absent.jsonl"), cache));
+  await assert.rejects(inspectRecoverySession(sessions, cache), /existing .jsonl/);
+  await assert.rejects(inspectRecoverySession(join(sessions, "broken.jsonl"), cache), /valid Pi session header/);
+});
+
+test("recovery refuses headless markers, durable evidence and legacy cached evidence", async () => {
+  const { inspectRecoverySession, rememberSessionKind } = await import("../dist-test/scan.js");
+  const { sessions, cache } = await fixture();
+  const path = join(sessions, "a.jsonl");
+  await assert.rejects(inspectRecoverySession(join(sessions, "headless.jsonl"), cache), /Known headless/);
+  await rememberSessionKind(cache, path, "sid", "headless");
+  await assert.rejects(inspectRecoverySession(path, cache), /Known headless/);
+  const legacy = join(sessions, "interactive.jsonl");
+  await writeFile(cache, JSON.stringify({ version: 4, markerSince: SINCE, sessions: {
+    [legacy]: { kind: "headless", summary: { id: "sid" } },
+  } }));
+  await assert.rejects(inspectRecoverySession(legacy, cache), /Known headless/);
+  // Evidence for a previous file at the same path must not taint a new ID.
+  await writeFile(path, header.replace('"sid"', '"replacement"'));
+  assert.equal((await inspectRecoverySession(path, cache)).id, "replacement");
+});
+
 test("defaultSessionDir mirrors Pi's encoding", async () => {
   const { defaultSessionDir } = await import("../dist-test/scan.js");
   assert.equal(defaultSessionDir("/agent/sessions", "/home/x/code:y"), "/agent/sessions/--home-x-code-y--");
